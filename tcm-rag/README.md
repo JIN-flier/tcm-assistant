@@ -58,3 +58,25 @@ python3 src/translation/translate_structured.py
 
 结果写入 `data/enriched/translations.jsonl`。每批按规范化文本总长度（默认 8,000 字符）提交；模型须返回原样的段落 ID 且顺序完全一致，否则该批会被拒绝。再次运行会根据 `unit_id + normalized_text_sha256` 跳过已完成译文，避免重复调用。
 
+## 第 4 步：PostgreSQL + pgvector
+
+`src/database/migrate.py` 是追加式迁移脚本。它维护 `public.schema_migrations`；已执行迁移的校验和若发生变化，脚本会终止，后续修改必须增加新的迁移版本。核心模型分为逻辑文献 `documents`、源文件版本 `document_versions`、结构节点 `nodes`、文本版本 `node_texts`、检索单元 `chunks` 和独立的 `chunk_embeddings`。
+
+在 `.env` 设置 `DATABASE_URL`，并确保目标 PostgreSQL 已安装 pgvector 扩展。预览迁移不连接数据库：
+
+```bash
+python3 src/database/migrate.py --dry-run
+```
+
+执行迁移：
+
+```bash
+python3 src/database/migrate.py
+```
+
+注册 embedding 模型后，可为该模型创建单独的余弦 HNSW 索引：
+python src/database/migrate.py \
+  --create-hnsw-index \
+  --index-name bge_m3_1024_cosine_hnsw \
+  --embedding-model-id e71f04de-a279-4aff-b017-011c2e6e4137 \
+  --dimensions 1024
