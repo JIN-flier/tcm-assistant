@@ -80,3 +80,34 @@ python src/database/migrate.py \
   --index-name bge_m3_1024_cosine_hnsw \
   --embedding-model-id e71f04de-a279-4aff-b017-011c2e6e4137 \
   --dimensions 1024
+
+## 第 5 步：本地 BGE-M3 RAG
+
+`src/rag/answer.py` 通过 BGE-M3 原生的 `FlagEmbedding.BGEM3FlagModel` 计算本地查询向量，不需要 embedding API。若模型是通过 Hugging Face Hub 标准缓存下载的，`RAG_EMBEDDING_MODEL=BAAI/bge-m3` 会命中缓存；若模型是手动下载的，则填写实际模型目录（不要填 `models--...` 父目录，而要填其 `snapshots/<revision>` 子目录）。
+
+```bash
+pip install -r requirements.txt
+```
+
+在 `.env` 添加（UUID 必须是已经写入 `tcm.embedding_models`、且用于现有 `chunk_embeddings` 的同一模型记录）：
+
+```dotenv
+RAG_EMBEDDING_BACKEND=flag_embedding
+RAG_EMBEDDING_MODEL=BAAI/bge-m3
+RAG_EMBEDDING_DIMENSIONS=1024
+RAG_EMBEDDING_MODEL_ID=e71f04de-a279-4aff-b017-011c2e6e4137
+RAG_EMBEDDING_NORMALIZE=true
+RAG_EMBEDDING_MAX_LENGTH=512
+RAG_EMBEDDING_USE_FP16=false
+RAG_ORIGINAL_EMBEDDING_TYPE=original
+RAG_MODERN_EMBEDDING_TYPE=modern
+RAG_CHAT_MODEL=<你的 OpenAI 兼容聊天模型名>
+```
+
+`RAG_CHAT_MODEL` 仍然通过当前的 OpenAI 兼容聊天接口调用，因此可继续使用已有的 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`（这不要求供应商是 OpenAI）。本地 BGE-M3 仅替代 embedding 调用。运行示例：
+
+```bash
+python3 src/rag/answer.py "《伤寒论》里发热、恶风、有汗如何描述？" --retrieve-only
+```
+
+模型输出维度会在检索前校验，必须为 1024，并且查询向量须使用和入库时相同的 BGE-M3 配置。若当初入库的向量未归一化，请将 `RAG_EMBEDDING_NORMALIZE=false`；否则余弦相似度的结果会和已有库不一致。`RAG_EMBEDDING_MAX_LENGTH` 也应与入库时一致；在可用 CUDA GPU 上，可设 `RAG_EMBEDDING_USE_FP16=true` 加速推理。

@@ -143,7 +143,20 @@ CREATE INDEX IF NOT EXISTS chunks_node_idx ON tcm.chunks(node_id, sequence);
 CREATE INDEX IF NOT EXISTS chunk_embeddings_model_idx ON tcm.chunk_embeddings(embedding_model_id, embedding_type);
 CREATE INDEX IF NOT EXISTS documents_metadata_gin_idx ON tcm.documents USING gin(metadata);
 CREATE INDEX IF NOT EXISTS chunks_metadata_gin_idx ON tcm.chunks USING gin(metadata);
-""")]
+"""),
+Migration("0002", "add publication year", """
+    ALTER TABLE tcm.documents
+    ADD COLUMN IF NOT EXISTS publication_year INTEGER;
+
+    CREATE INDEX IF NOT EXISTS documents_publication_year_idx
+    ON tcm.documents (publication_year);
+"""),
+Migration("0003", "add trigram lexical retrieval index", """
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;
+    CREATE INDEX IF NOT EXISTS chunks_text_trgm_idx
+    ON tcm.chunks USING gin (text gin_trgm_ops);
+"""),
+]
 
 
 def checksum(statement: str) -> str:
