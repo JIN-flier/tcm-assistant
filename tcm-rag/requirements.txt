@@ -1,5 +1,6 @@
-# Required only when running --llm-fallback.
+# Runtime dependencies for preprocessing, RAG, and the LangGraph agent.
 langchain-openai>=0.3
+langgraph>=0.2
 python-dotenv>=1.0
 pydantic>=2.0
 psycopg[binary]>=3.2

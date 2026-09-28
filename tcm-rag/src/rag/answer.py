@@ -55,9 +55,28 @@ class Hit:
     text_kind: str
     text: str
     score: float
+    source_file: str | None = None
+    source_start: int | None = None
+    source_end: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
     channels: list[str] = field(default_factory=list)
     rrf_score: float = 0.0
     rerank_reason: str | None = None
+
+
+@dataclass
+class RetrievalBundle:
+    """All retrieval stages, retained so callers can inspect the RAG pipeline."""
+
+    plan: QueryPlan
+    lexical: list[Hit]
+    original_vector: list[Hit]
+    modern_vector: list[Hit]
+    fused: list[Hit]
+    ranked: list[Hit]
+    passages: str
+    sources: list[Hit]
 
 
 def vector_literal(values: list[float]) -> str:
@@ -141,7 +160,16 @@ def metadata_filters(filters: Filters) -> tuple[str, list[Any]]:
 
 
 def to_hits(rows: Iterable[tuple[Any, ...]], channel: str) -> list[Hit]:
-    return [Hit(str(row[0]), str(row[1]), str(row[2]), row[3], row[4], row[5], row[6], row[7], float(row[8]), [channel]) for row in rows]
+    return [
+        Hit(
+            chunk_id=str(row[0]), document_id=str(row[1]), node_id=str(row[2]),
+            sequence=row[3], title=row[4], node_title=row[5], text_kind=row[6],
+            text=row[7], score=float(row[13]), source_file=row[8],
+            source_start=row[9], source_end=row[10], line_start=row[11], line_end=row[12],
+            channels=[channel],
+        )
+        for row in rows
+    ]
 
 
 class Retriever:
@@ -151,7 +179,8 @@ class Retriever:
     @staticmethod
     def select(score: str, joins: str, where: str) -> str:
         return f"""SELECT c.id, dv.document_id, c.node_id, c.sequence, d.canonical_title, n.title,
-            nt.text_kind, c.text, {score}
+            nt.text_kind, c.text, dv.source_file, n.source_start, n.source_end,
+            n.line_start, n.line_end, {score}
             FROM tcm.chunks c JOIN tcm.document_versions dv ON dv.id=c.document_version_id
             JOIN tcm.documents d ON d.id=dv.document_id JOIN tcm.nodes n ON n.id=c.node_id
             JOIN tcm.node_texts nt ON nt.id=c.source_text_id {joins} WHERE {where}"""
@@ -170,7 +199,7 @@ class Retriever:
         exact_score = "CASE WHEN (" + exact_match + ") THEN 1 ELSE 0 END"
         fuzzy_score = "GREATEST(" + ",".join("similarity(c.text, %s)" for _ in terms) + ")"
         score = f"({exact_score}) + ({fuzzy_score})"
-        statement = self.select(score, "", f"(({exact_match}) OR ({fuzzy_match})){extra} ORDER BY 9 DESC LIMIT %s")
+        statement = self.select(score, "", f"(({exact_match}) OR ({fuzzy_match})){extra} ORDER BY 14 DESC LIMIT %s")
         params = [*terms, *terms, *terms, *terms, *extra_params, limit]
         return to_hits(self.connection.execute(statement, params).fetchall(), "lexical")
 
@@ -231,6 +260,53 @@ def answer(question: str, passages: str, model_name: str) -> str:
     return response.content if isinstance(response.content, str) else str(response.content)
 
 
+def retrieve(
+    question: str,
+    *,
+    database_url: str,
+    embedding_model_id: str,
+    embedding_dimensions: int,
+    embedding_model: str,
+    embedding_backend: str,
+    chat_model: str,
+    retrieval_limit: int = 30,
+    fusion_limit: int = 40,
+    rerank_limit: int = 8,
+    context_chars: int = 12000,
+    use_reranker: bool = True,
+) -> RetrievalBundle:
+    """Run the complete retrieval pipeline without generating a final answer."""
+    plan = analyze(question, chat_model)
+    query_vector = embeddings(embedding_model, embedding_backend).embed_query(plan.semantic_query)
+    if len(query_vector) != embedding_dimensions:
+        raise ValueError(
+            f"embedding dimension mismatch: model returned {len(query_vector)}, "
+            f"but configured dimensions are {embedding_dimensions}"
+        )
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        retriever = Retriever(connection, embedding_model_id, embedding_dimensions)
+        lexical = retriever.lexical(plan, retrieval_limit)
+        original_vector = retriever.vector(
+            query_vector, plan, os.getenv("RAG_ORIGINAL_EMBEDDING_TYPE", "original"),
+            "original", "original_vector", retrieval_limit,
+        )
+        modern_vector = retriever.vector(
+            query_vector, plan, os.getenv("RAG_MODERN_EMBEDDING_TYPE", "modern"),
+            "modern_translation", "modern_vector", retrieval_limit,
+        )
+        fused = rrf([lexical, original_vector, modern_vector], limit=fusion_limit)
+        ranked = (
+            rerank(question, fused, chat_model, rerank_limit)
+            if use_reranker else fused[:rerank_limit]
+        )
+        passages, sources = context(retriever, ranked, context_chars)
+    return RetrievalBundle(
+        plan=plan, lexical=lexical, original_vector=original_vector,
+        modern_vector=modern_vector, fused=fused, ranked=ranked,
+        passages=passages, sources=sources,
+    )
+
+
 def main() -> None:
     # Load .env before parser defaults are evaluated.  Previously variables in
     # .env did not reach the RAG_* argument defaults unless also exported.
@@ -252,25 +328,26 @@ def main() -> None:
     args = parser.parse_args()
     if not args.embedding_model_id or not (args.database_url or os.environ.get("DATABASE_URL")) or not os.environ.get("OPENAI_API_KEY"):
         parser.error("DATABASE_URL, OPENAI_API_KEY, and RAG_EMBEDDING_MODEL_ID are required")
-    plan = analyze(args.question, args.chat_model)
-    query_vector = embeddings(args.embedding_model, args.embedding_backend).embed_query(plan.semantic_query)
-    if len(query_vector) != args.embedding_dimensions:
-        parser.error(
-            f"embedding dimension mismatch: model returned {len(query_vector)}, "
-            f"but --embedding-dimensions is {args.embedding_dimensions}. "
-            "It must match the vectors already stored in tcm.chunk_embeddings."
-        )
     database_url = args.database_url or os.environ["DATABASE_URL"]
-    with psycopg.connect(database_url, autocommit=True) as connection:
-        retriever = Retriever(connection, args.embedding_model_id, args.embedding_dimensions)
-        lists = [retriever.lexical(plan, args.retrieval_limit),
-                 retriever.vector(query_vector, plan, os.getenv("RAG_ORIGINAL_EMBEDDING_TYPE", "original"), "original", "original_vector", args.retrieval_limit),
-                 retriever.vector(query_vector, plan, os.getenv("RAG_MODERN_EMBEDDING_TYPE", "modern"), "modern_translation", "modern_vector", args.retrieval_limit)]
-        fused = rrf(lists, limit=args.fusion_limit)
-        ranked = fused[:args.rerank_limit] if args.no_rerank else rerank(args.question, fused, args.chat_model, args.rerank_limit)
-        passages, sources = context(retriever, ranked, args.context_chars)
-    result: dict[str, Any] = {"question": args.question, "query_plan": plan.model_dump(), "sources": [asdict(item) for item in sources]}
-    result["answer"] = None if args.retrieve_only else answer(args.question, passages, args.chat_model)
+    try:
+        bundle = retrieve(
+            args.question, database_url=database_url,
+            embedding_model_id=args.embedding_model_id,
+            embedding_dimensions=args.embedding_dimensions,
+            embedding_model=args.embedding_model,
+            embedding_backend=args.embedding_backend, chat_model=args.chat_model,
+            retrieval_limit=args.retrieval_limit, fusion_limit=args.fusion_limit,
+            rerank_limit=args.rerank_limit, context_chars=args.context_chars,
+            use_reranker=not args.no_rerank,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    result: dict[str, Any] = {
+        "question": args.question,
+        "query_plan": bundle.plan.model_dump(),
+        "sources": [asdict(item) for item in bundle.sources],
+    }
+    result["answer"] = None if args.retrieve_only else answer(args.question, bundle.passages, args.chat_model)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

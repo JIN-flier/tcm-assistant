@@ -1,113 +1,278 @@
-# TCM RAG: 第 1 步数据审计
+# TCM RAG 与 LangGraph 健康知识 Agent
 
-本仓库当前只实现 `TCM-preprocess.md` 所述的第 1 步：对 `data/raw/` 中已筛选的资料生成可复现、可追溯的审计记录。原始文件不会被改写。
+本项目包含中医语料审计、结构化、翻译、PostgreSQL/pgvector 导入、混合 RAG，以及一个可调试的 LangGraph 健康知识 Agent。
 
-运行：
+Agent 的定位是“健康咨询 / 中医知识辅助”，不是自动诊断或自动开方系统。它会保存用户明确提供的基本情况，以本地 JSON 作为唯一用户档案来源；会经过风险分流后检索古籍，并由 LLM 决定是否需要回到原始语料文件核对命中位置。默认输出完整调试 JSON。
 
-```bash
-python3 src/audit/build_audit.py
+## 目录与主要入口
+
+```text
+src/
+├── agent/
+│   ├── health_agent.py       # LangGraph 状态机与 CLI
+│   ├── profile_store.py      # 本地 JSON 档案、校验、原子写入
+│   └── source_reader.py      # 受限的原始文件片段读取
+├── rag/answer.py             # 混合检索、RRF、重排和独立 RAG CLI
+├── audit/build_audit.py
+├── parser/structure_parser.py
+├── translation/translate_structured.py
+└── database/
+    ├── migrate.py
+    ├── import_translations.py
+    └── inspect_database.py
 ```
 
-产物：
-
-- `data/audit/documents.jsonl`：一行一个文件的 JSON 审计记录。
-- `data/audit/report.json`：总量、类型、元数据覆盖率、质量异常和重复记录统计。
-
-记录包含原始和规范化文本的 SHA-256、书名/作者/年代/目录分类、卷数、编码与 OCR 风险，以及 `field_sources` 和 `classification.evidence`。因此每个非空元数据值都能追溯到文件头、目录式文件名或明确的规则；不能可靠提取的值为 `null`。
-
-`text_type` 的规则优先级为：明确的现代年份、现代书名信号、参考书信号、医案信号、注释信号，再到古籍默认值。默认值的置信度是 `low`，方便在人工复核或后续 LLM 复核时优先处理，而不是把规则结果伪装成书目事实。
-
-重新运行会完整重建审计结果，适合以哈希做后续增量处理。JSONL 使用稳定的键排序；生成时间只存在于统计报告中。
-
-## 第 2 步：古籍结构化与 Markdown
-
-默认解析审计结果中 `ancient_classical`、`commentary` 和 `medical_case` 三类资料：
-
-```bash
-python3 src/parser/structure_parser.py
-```
-
-输出在 `data/structured/`：`documents.jsonl` 保存统一 AST（每个节点都有原文字符、行号范围和解析证据），`markdown/<document_id>.md` 是排版规范化后的 Markdown。解析会合并不构成段落的换行、移除 tcmoc 中可见的 `\\x` / `\\n` 等布局转义标记，并清除汉字之间的异常空格；不会改写词句。
-
-规则识别 `<目录>`、`<篇名>`、卷、篇章和节标题。仅在规则未识别的短行需要复核时，才可选择开启 LLM 兜底：
+## 安装与配置
 
 ```bash
 pip install -r requirements.txt
-python3 src/parser/structure_parser.py --llm-fallback
+cp .env.example .env
 ```
 
-LLM 经 LangChain 调用，只能从候选行中返回节点类型与层级；其 JSON 响应会经过枚举与行号校验，不能改写正文或覆盖规则标题。使用 `--include-all` 可把现代资料和参考书一并解析。
+至少配置：
 
-结果：699/699 文件均有稳定 document_id、原始与规范化 SHA-256、标题和分类证据。初步分类为古籍 611、注释本 36、医案 33、现代资料 14、参考资料 5；未发现完全重复文件。37 份被标记为疑似 OCR 问题，进入 needs_review。
+```dotenv
+OPENAI_API_KEY=...
+RAG_CHAT_MODEL=...
+DATABASE_URL=postgresql://...
+RAG_EMBEDDING_MODEL_ID=<tcm.embedding_models 中的 UUID>
+```
 
-## 第 3 步：原文、规范化原文与现代译文
+默认使用本地 BGE-M3。`RAG_EMBEDDING_DIMENSIONS`、是否归一化和最大长度必须与入库向量时完全一致。使用 OpenAI 兼容服务时，可额外设置 `OPENAI_BASE_URL`。
 
-翻译器读取结构化 JSONL 的段落节点，逐条输出原文、规范化原文、现代汉语译文、结构路径、审计元数据与翻译 provenance；不会覆盖第 1、2 步产物。
+## 运行 Agent
 
-在 `.env` 设置 `OPENAI_API_KEY`、可选的 `OPENAI_BASE_URL` 与 `TRANSLATION_LLM_MODEL`，并安装依赖。建议先限制为小样本：
+请从仓库根目录使用模块方式运行：
 
 ```bash
-python3 src/translation/translate_structured.py --max-units 20 --fail-fast
+python -m src.agent.health_agent \
+  "我42岁，女，有高血压。最近想查古籍里对夜间出汗怎么说。"
 ```
 
-全量运行：
+第一次运行时，如果 `data/user/profile.json` 不存在，会自动创建默认档案。每次请求都会重新读取该文件；本轮明确提供的新信息经结构化校验后原子写回。未提及的字段不会被当成 `false`，例如未知妊娠状态保持 `unknown`。
+
+只看最终回答：
 
 ```bash
-python3 src/translation/translate_structured.py
+python -m src.agent.health_agent \
+  "《伤寒论》中发热、恶风、有汗如何描述？" \
+  --final-only
 ```
 
-结果写入 `data/enriched/translations.jsonl`。每批按规范化文本总长度（默认 8,000 字符）提交；模型须返回原样的段落 ID 且顺序完全一致，否则该批会被拒绝。再次运行会根据 `unit_id + normalized_text_sha256` 跳过已完成译文，避免重复调用。
-
-## 第 4 步：PostgreSQL + pgvector
-
-`src/database/migrate.py` 是追加式迁移脚本。它维护 `public.schema_migrations`；已执行迁移的校验和若发生变化，脚本会终止，后续修改必须增加新的迁移版本。核心模型分为逻辑文献 `documents`、源文件版本 `document_versions`、结构节点 `nodes`、文本版本 `node_texts`、检索单元 `chunks` 和独立的 `chunk_embeddings`。
-
-在 `.env` 设置 `DATABASE_URL`，并确保目标 PostgreSQL 已安装 pgvector 扩展。预览迁移不连接数据库：
+使用另一份独立档案：
 
 ```bash
-python3 src/database/migrate.py --dry-run
+python -m src.agent.health_agent \
+  "我对青霉素过敏，请记住" \
+  --profile-file data/user/demo-profile.json
 ```
 
-执行迁移：
+知识检索示例：
 
 ```bash
-python3 src/database/migrate.py
+python -m src.agent.health_agent \
+  "《本草纲目》如何论述人参？"
 ```
 
-注册 embedding 模型后，可为该模型创建单独的余弦 HNSW 索引：
+风险分流示例：
+
+```bash
+python -m src.agent.health_agent \
+  "我胸口剧痛而且出冷汗，想先按中医辨证看看"
+```
+
+这类命中确定性红旗规则的请求会在风险分流后终止普通 RAG/建议流程，并优先提示紧急医疗评估。
+
+Python 调用示例见 [examples/use_agent.py](examples/use_agent.py)，可用 `python -m examples.use_agent` 执行。
+
+## LangGraph 流程
+
+```text
+START
+  → load_profile
+  → understand
+  → persist_profile
+  → triage ──高风险──→ urgent_response → END
+  → case_analysis
+  → retrieve（按意图选择）
+  → decide_originals
+  → read_originals（按 LLM 决策选择）
+  → advice_plan
+  → formula_gate
+  → generate
+  → verify
+  → revise（最多一次）
+  → finalize
+  → END
+```
+
+这是确定性状态机：LLM 负责节点内的结构化理解和生成，不能自由改变图的安全顺序。
+
+### 原始文件按需读取
+
+RAG 命中包含 `source_file`、节点字符范围和行号。重排后，LLM 只能从已有 `chunk_id` 中选择最多 3 个；只有在需要核对逐字引用、扩展上下文或处理译文歧义时才读取。读取器会：
+
+- 将路径限制在 `TCM_DATA_ROOT`，拒绝绝对路径和目录穿越；
+- 优先按 `source_start/source_end` 读取；
+- 其次按行号或原文精确定位；
+- 每个片段限制长度，不会默认把整本古籍送进上下文；
+- 把读取成功、编码、范围或失败原因写入调试输出。
+
+## 调试输出
+
+默认 stdout 是一个 JSON 对象，主要字段如下：
+
+```json
+{
+  "profile": {
+    "file": ".../data/user/profile.json",
+    "before": {},
+    "after": {},
+    "changed_fields": ["age", "biological_sex"]
+  },
+  "intent": {
+    "intent": "health_consultation",
+    "should_retrieve": true
+  },
+  "risk_assessment": {},
+  "case_analysis": {},
+  "keywords": ["盗汗", "夜间汗出"],
+  "query_plan": {},
+  "rag": {
+    "channels": {
+      "lexical": [],
+      "original_vector": [],
+      "modern_vector": []
+    },
+    "fused": [],
+    "ranked": [],
+    "context_sources": []
+  },
+  "original_source_read": {
+    "decision": {},
+    "excerpts": []
+  },
+  "advice_plan": {},
+  "formula_safety": {},
+  "llm_outputs": {
+    "draft_answer": "...",
+    "verification": {},
+    "revised_answer": null
+  },
+  "graph_trace": [],
+  "final_answer": "..."
+}
+```
+
+三路召回各自保留，方便验证关键词、向量召回、RRF 和 reranker。为控制日志体积，调试 JSON 中每个 chunk 文本默认截到 1,200 字符；真正传给生成模型的 `rag_context` 仍受 `--context-chars` 独立控制。
+
+## 用户档案
+
+自动创建的原始 JSON 形态为：
+
+```json
+{
+  "schema_version": "1.0",
+  "user_id": "local-user",
+  "updated_at": null,
+  "name": null,
+  "age": null,
+  "biological_sex": "unknown",
+  "height_cm": null,
+  "weight_kg": null,
+  "pregnancy_status": "unknown",
+  "medical_history": [],
+  "current_medications": [],
+  "allergies": [],
+  "tcm_context": {
+    "sleep": null,
+    "appetite": null,
+    "stool": null,
+    "urination": null,
+    "cold_heat": null,
+    "sweating": null,
+    "tongue": null,
+    "pulse": null
+  }
+}
+```
+
+写入采用临时文件 + `os.replace`，最终文件权限设为 `0600`。该实现适合单机单用户原型；生产环境仍需补充加密、身份认证、并发控制、保留周期和删除机制。
+
+## 独立运行混合 RAG
+
+```bash
+python -m src.rag.answer \
+  "《伤寒论》里发热、恶风、有汗如何描述？" \
+  --retrieve-only
+```
+
+检索流程为：查询分析 → lexical/original vector/modern vector 三路召回 → RRF → reranker → 相邻上下文扩展。`src/rag/answer.py` 也导出 `retrieve(...)`，供 Agent 复用同一实现。
+
+## 数据处理流程
+
+### 1. 审计
+
+```bash
+python src/audit/build_audit.py
+```
+
+生成 `data/audit/documents.jsonl` 和 `data/audit/report.json`，不会修改 `data/raw/`。
+
+### 2. 结构解析
+
+```bash
+python src/parser/structure_parser.py
+```
+
+可选 LLM 标题兜底：
+
+```bash
+python src/parser/structure_parser.py --llm-fallback
+```
+
+### 3. 翻译与规范化
+
+小样本：
+
+```bash
+python src/translation/translate_structured.py --max-units 20 --fail-fast
+```
+
+全量：
+
+```bash
+python src/translation/translate_structured.py
+```
+
+### 4. PostgreSQL + pgvector
+
+预览并执行追加式迁移：
+
+```bash
+python src/database/migrate.py --dry-run
+python src/database/migrate.py
+```
+
+导入翻译产物：
+
+```bash
+python src/database/import_translations.py
+```
+
+为一个 embedding 模型创建 HNSW 索引：
+
+```bash
 python src/database/migrate.py \
   --create-hnsw-index \
   --index-name bge_m3_1024_cosine_hnsw \
   --embedding-model-id e71f04de-a279-4aff-b017-011c2e6e4137 \
   --dimensions 1024
-
-## 第 5 步：本地 BGE-M3 RAG
-
-`src/rag/answer.py` 通过 BGE-M3 原生的 `FlagEmbedding.BGEM3FlagModel` 计算本地查询向量，不需要 embedding API。若模型是通过 Hugging Face Hub 标准缓存下载的，`RAG_EMBEDDING_MODEL=BAAI/bge-m3` 会命中缓存；若模型是手动下载的，则填写实际模型目录（不要填 `models--...` 父目录，而要填其 `snapshots/<revision>` 子目录）。
-
-```bash
-pip install -r requirements.txt
 ```
 
-在 `.env` 添加（UUID 必须是已经写入 `tcm.embedding_models`、且用于现有 `chunk_embeddings` 的同一模型记录）：
+## 当前安全边界与未实现项
 
-```dotenv
-RAG_EMBEDDING_BACKEND=flag_embedding
-RAG_EMBEDDING_MODEL=BAAI/bge-m3
-RAG_EMBEDDING_DIMENSIONS=1024
-RAG_EMBEDDING_MODEL_ID=e71f04de-a279-4aff-b017-011c2e6e4137
-RAG_EMBEDDING_NORMALIZE=true
-RAG_EMBEDDING_MAX_LENGTH=512
-RAG_EMBEDDING_USE_FP16=false
-RAG_ORIGINAL_EMBEDDING_TYPE=original
-RAG_MODERN_EMBEDDING_TYPE=modern
-RAG_CHAT_MODEL=<你的 OpenAI 兼容聊天模型名>
-```
-
-`RAG_CHAT_MODEL` 仍然通过当前的 OpenAI 兼容聊天接口调用，因此可继续使用已有的 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`（这不要求供应商是 OpenAI）。本地 BGE-M3 仅替代 embedding 调用。运行示例：
-
-```bash
-python3 src/rag/answer.py "《伤寒论》里发热、恶风、有汗如何描述？" --retrieve-only
-```
-
-模型输出维度会在检索前校验，必须为 1024，并且查询向量须使用和入库时相同的 BGE-M3 配置。若当初入库的向量未归一化，请将 `RAG_EMBEDDING_NORMALIZE=false`；否则余弦相似度的结果会和已有库不一致。`RAG_EMBEDDING_MAX_LENGTH` 也应与入库时一致；在可用 CUDA GPU 上，可设 `RAG_EMBEDDING_USE_FP16=true` 加速推理。
+- 确定性红旗规则和 LLM 风险分流都在任何古籍建议之前执行。
+- 当前仓库没有经过审核的现代安全知识库、药物-中药相互作用库或剂量库，因此方剂安全门默认阻止个体化方剂、剂量、服法和配药指令，只允许无剂量的历史知识说明。
+- 最终回答由独立校验节点检查，发现问题最多修订一次，避免无限循环。
+- 本次没有实现文档第 14 节“Agent 评测体系”和第 15 节“专门安全测试集”；也没有加入相关指标、数据集或评测脚本。
