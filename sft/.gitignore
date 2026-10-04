@@ -1,1 +1,5 @@
+.env
+__pycache__/
+*.py[cod]
+data/
 lora_result/
