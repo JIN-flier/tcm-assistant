@@ -1,0 +1,26 @@
+# 文件清单
+
+- `README.md`：完整复现文档
+- `scripts/env.sh`：所有路径和临时环境变量
+- `scripts/setup_env.sh`：uv 环境和依赖安装
+- `scripts/download_model.sh`：Qwen3-8B 下载
+- `scripts/download_datasets.sh`：HF CLI 下载四组数据
+- `scripts/download_datasets.py`：Python 下载替代方案
+- `scripts/inspect_json.py`：抽查 JSON 字段
+- `scripts/normalize_sft.py`：转 messages、清洗、移除显式 think
+- `scripts/deduplicate.py`：领域 exact dedup
+- `scripts/filter_by_tokens.py`：按 token 长度过滤
+- `scripts/filter_overlap.py`：通用/领域交叉 exact dedup
+- `scripts/sample_exact.py`：可复现精确抽样
+- `scripts/prepare_qwen3_split.py`：添加 empty think，划分 train/val/test
+- `scripts/token_stats.py`：Qwen3 tokenizer 长度统计
+- `scripts/prepare_data.sh`：完整数据流水线
+- `scripts/smoke_test.sh`：20-step smoke test
+- `scripts/train_lora.sh`：正式 LoRA SFT
+- `scripts/resume_latest.sh`：从最新 checkpoint 自动续训
+- `scripts/find_best_checkpoint.py`：查看 best checkpoint 和 eval loss
+- `scripts/infer_lora.sh`：交互式 LoRA 推理
+- `scripts/benchmark_base_vs_lora.py`：Base / LoRA 回答和速度 A/B
+- `scripts/check_lora_weights.py`：检查 LoRA 是否非零
+- `scripts/check_lora_effect.py`：检查 LoRA 是否改变 logits
+- `scripts/check_lora_update_ratio.py`：计算 `||ΔW|| / ||W||`
