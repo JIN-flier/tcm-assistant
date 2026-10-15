@@ -42,6 +42,22 @@ RAG_EMBEDDING_MODEL_ID=<tcm.embedding_models 中的 UUID>
 
 ## 运行 Agent
 
+### 终端交互界面（TUI）
+
+安装上述依赖后运行：
+
+```bash
+python use_agent.py
+```
+
+在输入框中输入问题，按 Enter 或点击“提问”。左侧以 Markdown 展示最终回答，右侧展示可展开的 RAG 来源；窄终端会自动改为上下排列。已引用的条目默认展开，包含书名、章节、原文/译文、来源文件、位置和片段。`[S1]` 等编号严格对应实际送入模型的上下文（包含相邻片段），`[R1]` 等对应原始文件回读，并显示读取成功或失败状态。检索片段沿用调试输出长度限制，可能被截断。
+
+请求在后台执行，界面显示等待时间，完成后显示关键词、来源数和 LLM 调用次数。请求失败会保留输入，便于检查配置后重试；未检索、未命中和无上下文来源会分别提示。按 `Ctrl+L` 聚焦输入框，按 `Ctrl+Q` 退出；可以用 Tab 切换焦点，滚动查看长回答和来源。
+
+默认读取仓库根目录的 `.env`，沿用 `use_agent.py` 原有的模型配置；可通过 `TCM_PROFILE_FILE` 和 `TCM_DATA_ROOT` 指定档案和语料目录。每次提交都是独立问题，继续使用本地用户档案，不携带上一轮聊天记录。
+
+### 命令行与 Python API
+
 请从仓库根目录使用模块方式运行：
 
 ```bash
@@ -89,34 +105,46 @@ Python 调用示例见 [examples/use_agent.py](examples/use_agent.py)，可用 `
 
 ```text
 START
-  → load_profile
-  → understand
-  → persist_profile
-  → triage ──高风险──→ urgent_response → END
-  → case_analysis
-  → retrieve（按意图选择）
-  → decide_originals
-  → read_originals（按 LLM 决策选择）
-  → advice_plan
-  → formula_gate
-  → generate
-  → verify
-  → revise（最多一次）
-  → finalize
-  → END
+  → prepare（读取档案、本地红旗规则）
+  → analyze（一次 LLM：意图、档案更新、风险、检索计划）
+  → retrieve（按意图选择，直接复用检索计划）
+  → respond（一次 LLM：直接回答，或请求回读原文）
+      ├─ 直接回答 → END
+      └─ read_originals → respond（必须最终回答）→ END
+
+prepare / analyze 判断为紧急风险 → urgent_response（固定提示）→ END
 ```
 
-这是确定性状态机：LLM 负责节点内的结构化理解和生成，不能自由改变图的安全顺序。
+常规请求默认只调用 **2 次 LLM**。意图识别、档案抽取、风险分流和关键词/过滤条件分析在第一次调用中完成；第二次调用基于 RAG 证据回答，并同时决定是否有必要回读原文。健康咨询和知识查询即使没有生成检索计划，代码也会用用户原问题构建备用计划并执行检索。
+
+Agent 默认使用 RRF 排序，不额外调用 LLM 重排，也不再单独调用病例分析、建议规划、原文决策、校验和修订模型。独立 RAG CLI 的默认行为保持不变。
+
+| 请求路径 | 默认 LLM 调用次数 |
+|---|---:|
+| 健康咨询 / 知识查询 / 档案管理 / 寒暄 | 2 |
+| 回读原始文件后再回答 | 3 |
+| 本地红旗规则直接拦截 | 0 |
+| 首次分析识别紧急风险后拦截 | 1 |
+
+如需要 LLM 重排，可显式开启，成功召回候选后额外调用一次：
+
+```bash
+python -m src.agent.health_agent "《本草纲目》如何论述人参？" --rerank
+```
+
+Python API 对应设置 `AgentSettings(..., use_reranker=True)`。`--no-rerank` 仍然兼容，且现在是默认行为。`llm_call_count` 记录应用层聊天模型调用次数（包含显式重排），不包含 embedding 计算或 SDK 网络重试。
 
 ### 原始文件按需读取
 
-RAG 命中包含 `source_file`、节点字符范围和行号。重排后，LLM 只能从已有 `chunk_id` 中选择最多 3 个；只有在需要核对逐字引用、扩展上下文或处理译文歧义时才读取。读取器会：
+RAG 命中包含 `source_file`、节点字符范围和行号。回答模型可以从排序后的候选 `chunk_id` 中选择最多 3 个；只有在需要核对逐字引用、扩展上下文或处理译文歧义时才读取。原文回读最多一轮，读取后必须完成回答，读取失败时也不会再次请求。读取器会：
 
 - 将路径限制在 `TCM_DATA_ROOT`，拒绝绝对路径和目录穿越；
 - 优先按 `source_start/source_end` 读取；
 - 其次按行号或原文精确定位；
 - 每个片段限制长度，不会默认把整本古籍送进上下文；
 - 把读取成功、编码、范围或失败原因写入调试输出。
+
+原始文件片段带有独立的 `source_label`，例如 `R1`，最终回答可以用 `[R1]` 引用；RAG 上下文继续使用 `[S1]` 等编号。
 
 ## 调试输出
 
@@ -135,10 +163,11 @@ RAG 命中包含 `source_file`、节点字符范围和行号。重排后，LLM �
     "should_retrieve": true
   },
   "risk_assessment": {},
-  "case_analysis": {},
   "keywords": ["盗汗", "夜间汗出"],
   "query_plan": {},
   "rag": {
+    "status": "completed",
+    "ranking_method": "rrf",
     "channels": {
       "lexical": [],
       "original_vector": [],
@@ -152,19 +181,26 @@ RAG 命中包含 `source_file`、节点字符范围和行号。重排后，LLM �
     "decision": {},
     "excerpts": []
   },
-  "advice_plan": {},
-  "formula_safety": {},
+  "llm_call_count": 2,
   "llm_outputs": {
-    "draft_answer": "...",
-    "verification": {},
-    "revised_answer": null
+    "analysis": {},
+    "responses": [
+      {
+        "action": "answer",
+        "final_answer": "...",
+        "chunk_ids": [],
+        "reason": "已有证据足够"
+      }
+    ]
   },
   "graph_trace": [],
   "final_answer": "..."
 }
 ```
 
-三路召回各自保留，方便验证关键词、向量召回、RRF 和 reranker。为控制日志体积，调试 JSON 中每个 chunk 文本默认截到 1,200 字符；真正传给生成模型的 `rag_context` 仍受 `--context-chars` 独立控制。
+三路召回各自保留，方便验证关键词、向量召回和排序。`llm_outputs.analysis` 保存首次合并分析的模型结果；`responses` 保存回答模型的结构化输出，回读时有两条记录。原来的病例候选、建议规划和独立校验输出字段已移除。跳过检索的分支仍返回完整的空 `rag` 对象，可以安全访问 `rag.ranked`。
+
+为控制日志体积，调试 JSON 中每个 chunk 文本默认截到 1,200 字符；真正传给生成模型的 `rag_context` 仍受 `--context-chars` 独立控制。
 
 ## 用户档案
 
@@ -273,6 +309,6 @@ python src/database/migrate.py \
 ## 当前安全边界与未实现项
 
 - 确定性红旗规则和 LLM 风险分流都在任何古籍建议之前执行。
-- 当前仓库没有经过审核的现代安全知识库、药物-中药相互作用库或剂量库，因此方剂安全门默认阻止个体化方剂、剂量、服法和配药指令，只允许无剂量的历史知识说明。
-- 最终回答由独立校验节点检查，发现问题最多修订一次，避免无限循环。
+- 当前仓库没有经过审核的现代安全知识库、药物-中药相互作用库或剂量库，回答提示词仍限制个体化方剂、剂量、服法和配药指令，只允许无剂量的历史知识说明。
+- 精简流程已移除独立的 LLM 校验和修订节点；当前回答不经过第二模型审核。原文读取最多一轮，避免无限循环。
 - 本次没有实现文档第 14 节“Agent 评测体系”和第 15 节“专门安全测试集”；也没有加入相关指标、数据集或评测脚本。

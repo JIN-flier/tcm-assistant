@@ -274,9 +274,14 @@ def retrieve(
     rerank_limit: int = 8,
     context_chars: int = 12000,
     use_reranker: bool = True,
+    query_plan: QueryPlan | None = None,
 ) -> RetrievalBundle:
-    """Run the complete retrieval pipeline without generating a final answer."""
-    plan = analyze(question, chat_model)
+    """Retrieve evidence, reusing an existing plan to avoid another LLM call.
+
+    With ``query_plan`` supplied and ``use_reranker=False``, this function
+    performs no chat-model calls. Standalone RAG callers keep their defaults.
+    """
+    plan = query_plan if query_plan is not None else analyze(question, chat_model)
     query_vector = embeddings(embedding_model, embedding_backend).embed_query(plan.semantic_query)
     if len(query_vector) != embedding_dimensions:
         raise ValueError(
@@ -297,7 +302,7 @@ def retrieve(
         fused = rrf([lexical, original_vector, modern_vector], limit=fusion_limit)
         ranked = (
             rerank(question, fused, chat_model, rerank_limit)
-            if use_reranker else fused[:rerank_limit]
+            if use_reranker and fused else fused[:rerank_limit]
         )
         passages, sources = context(retriever, ranked, context_chars)
     return RetrievalBundle(
